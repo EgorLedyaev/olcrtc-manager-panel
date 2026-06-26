@@ -8,6 +8,7 @@ import (
 	"crypto/rand"
 	"crypto/subtle"
 	"embed"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -18,6 +19,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -45,12 +47,17 @@ var adminConfigPath string
 
 const defaultGeneratedJitsiBase = "https://meet.handyweb.org"
 
+// Friend-facing base for subscription URLs returned by POST /api/friends, when
+// Config.PublicSubBase is unset. Points at the nginx /wtsub/ alias for this deployment.
+const defaultPublicSubBase = "https://api-gateway-service.top:2764/wtsub"
+
 type Config struct {
 	Version          int        `json:"version"`
 	LegacyVersion    int        `json:"vesion"`
 	Name             string     `json:"name"`
 	Port             int        `json:"port"`
 	SubscriptionPath string     `json:"subscription_path"`
+	PublicSubBase    string     `json:"public_sub_base,omitempty"`
 	Refresh          string     `json:"refresh,omitempty"`
 	ActiveLocationID string     `json:"active_location_id"`
 	Clients          []Client   `json:"clients"`
@@ -74,6 +81,7 @@ func (c Config) MarshalJSON() ([]byte, error) {
 		Name             string   `json:"name"`
 		Port             int      `json:"port"`
 		SubscriptionPath string   `json:"subscription_path,omitempty"`
+		PublicSubBase    string   `json:"public_sub_base,omitempty"`
 		Refresh          string   `json:"refresh,omitempty"`
 		ActiveLocationID string   `json:"active_location_id,omitempty"`
 		Clients          []Client `json:"clients"`
@@ -83,6 +91,7 @@ func (c Config) MarshalJSON() ([]byte, error) {
 		Name:             c.Name,
 		Port:             c.Port,
 		SubscriptionPath: c.SubscriptionPath,
+		PublicSubBase:    c.PublicSubBase,
 		Refresh:          c.Refresh,
 		ActiveLocationID: c.ActiveLocationID,
 		Clients:          c.Clients,
@@ -566,6 +575,24 @@ func run() error {
 		}
 		w.WriteHeader(http.StatusCreated)
 		writeJSON(w, map[string]string{"client_id": clientID})
+	})))
+	handler.Handle("/api/friends", adminAuth(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			w.Header().Set("Allow", http.MethodPost)
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		resp, err := addFriendFromRequest(configPath, r)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		if err := reload(); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		w.WriteHeader(http.StatusCreated)
+		writeJSON(w, resp)
 	})))
 	handler.Handle("/api/clients/", adminAuth(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodDelete && r.Method != http.MethodPut && r.Method != http.MethodPost {
@@ -1345,6 +1372,129 @@ func addClientFromRequest(ctx context.Context, configPath, olcrtcPath string, r 
 		return "", err
 	}
 	return req.ClientID, nil
+}
+
+type addFriendRequest struct {
+	ClientID  string `json:"client_id"`
+	Name      string `json:"name"`
+	VlessLink string `json:"vless_link"`
+	DualRoute *bool  `json:"dual_route"`
+	DNS       string `json:"dns"`
+}
+
+type addFriendResponse struct {
+	ClientID        string `json:"client_id"`
+	OlcrtcURI       string `json:"olcrtc_uri"`
+	SubToken        string `json:"sub_token"`
+	SubscriptionURL string `json:"subscription_url"`
+	DeepLink        string `json:"deep_link"`
+}
+
+// addFriendFromRequest creates a new client with a fresh jitsi olcrtc location
+// (room + key + stable uid), an always-on sub_token, and an optional pasted VLESS
+// half, then returns the ready subscription URL + one-tap deep link for QR/sharing.
+func addFriendFromRequest(configPath string, r *http.Request) (addFriendResponse, error) {
+	var req addFriendRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		return addFriendResponse{}, fmt.Errorf("parse request: %w", err)
+	}
+	req.ClientID = strings.TrimSpace(req.ClientID)
+	req.Name = strings.TrimSpace(req.Name)
+	req.VlessLink = strings.TrimSpace(req.VlessLink)
+	req.DNS = strings.TrimSpace(req.DNS)
+	if req.ClientID == "" {
+		return addFriendResponse{}, errors.New("client_id is required")
+	}
+	if strings.Contains(req.ClientID, "/") {
+		return addFriendResponse{}, errors.New("client_id must not contain slash")
+	}
+	name := req.Name
+	if name == "" {
+		name = "VPS-main"
+	}
+	if strings.ContainsAny(name, "\r\n") {
+		return addFriendResponse{}, errors.New("name must not contain newlines")
+	}
+	dns := req.DNS
+	if dns == "" {
+		dns = "77.88.8.8:53"
+	}
+
+	cfg, err := loadConfig(configPath)
+	if err != nil {
+		return addFriendResponse{}, err
+	}
+	cfg.ensureClientsFormat()
+	for _, c := range cfg.Clients {
+		if c.ClientID == req.ClientID {
+			return addFriendResponse{}, fmt.Errorf("client %q already exists", req.ClientID)
+		}
+	}
+
+	roomID, err := generateRoomIDForCarrier("jitsi", "")
+	if err != nil {
+		return addFriendResponse{}, err
+	}
+	key, err := randomHex(32)
+	if err != nil {
+		return addFriendResponse{}, err
+	}
+	uid, err := randomUUID()
+	if err != nil {
+		return addFriendResponse{}, err
+	}
+	token, err := generateSubToken()
+	if err != nil {
+		return addFriendResponse{}, err
+	}
+
+	loc := Location{
+		Name:      name,
+		ClientID:  req.ClientID,
+		Endpoint:  Endpoint{RoomID: roomID, Key: key},
+		Carrier:   "jitsi",
+		Transport: Transport{Type: "datachannel"},
+		DNS:       dns,
+		Uid:       uid,
+	}
+	client := Client{
+		ClientID:  req.ClientID,
+		Locations: []Location{loc},
+		SubToken:  token,
+	}
+	if req.VlessLink != "" {
+		client.Vless = &VlessConfig{Link: req.VlessLink, DualRoute: req.DualRoute}
+	}
+	cfg.Clients = append(cfg.Clients, client)
+	cfg.Normalize()
+	if err := cfg.Validate(); err != nil {
+		return addFriendResponse{}, err
+	}
+	if err := saveConfig(configPath, cfg); err != nil {
+		return addFriendResponse{}, err
+	}
+
+	base := strings.TrimRight(cfg.PublicSubBase, "/")
+	if base == "" {
+		base = defaultPublicSubBase
+	}
+	subURL := fmt.Sprintf("%s/%s?format=wireturn&token=%s", base, url.PathEscape(req.ClientID), url.QueryEscape(token))
+	deepLink := fmt.Sprintf("wireturn://addsub?url=%s&name=%s", url.QueryEscape(subURL), url.QueryEscape(name))
+	return addFriendResponse{
+		ClientID:        req.ClientID,
+		OlcrtcURI:       locationURI(loc),
+		SubToken:        token,
+		SubscriptionURL: subURL,
+		DeepLink:        deepLink,
+	}, nil
+}
+
+func generateSubToken() (string, error) {
+	buf := make([]byte, 18)
+	if _, err := rand.Read(buf); err != nil {
+		return "", err
+	}
+	return base64.RawURLEncoding.EncodeToString(buf), nil
 }
 
 func updateClientFromRequest(ctx context.Context, configPath, olcrtcPath, clientID string, r *http.Request) error {
