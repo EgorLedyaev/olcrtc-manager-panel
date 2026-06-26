@@ -1,6 +1,7 @@
 package main
 
 import (
+	"archive/zip"
 	"bufio"
 	"bytes"
 	"context"
@@ -93,6 +94,22 @@ type Client struct {
 	Refresh   string     `json:"refresh,omitempty"`
 	Quota     Quota      `json:"quota,omitempty"`
 	Locations []Location `json:"locations"`
+	// Vless: optional per-client VLESS half, served (READ-ONLY) inside the
+	// WireTurn-format subscription for dual-route. Pasted by the admin; the panel
+	// never manages x-ui/xray.
+	Vless *VlessConfig `json:"vless,omitempty"`
+	// SubToken: when set, the WireTurn-format subscription (which carries the
+	// vless credential) requires ?token=<SubToken>. The olcrtc-only text sub is
+	// unaffected.
+	SubToken string `json:"sub_token,omitempty"`
+}
+
+type VlessConfig struct {
+	Link          string `json:"link"`
+	DualRoute     *bool  `json:"dual_route,omitempty"`
+	DirectAddress string `json:"direct_address,omitempty"`
+	HCInterval    string `json:"hc_interval,omitempty"`
+	Mux           string `json:"mux,omitempty"`
 }
 
 type Quota struct {
@@ -113,6 +130,9 @@ type Location struct {
 	Data      string      `json:"data"`
 	DNS       string      `json:"dns"`
 	Proxy     Socks5Proxy `json:"proxy,omitempty"`
+	// Uid: stable per-location id for WireTurn-subscription matching; survives
+	// key/room rotation. Set once at creation; never rewritten by rotation.
+	Uid string `json:"uid,omitempty"`
 }
 
 type Endpoint struct {
@@ -770,6 +790,12 @@ func (s *Supervisor) SubscriptionForClient(clientID string, now time.Time) (stri
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return subscriptionForClient(s.cfg, clientID, now)
+}
+
+func (s *Supervisor) WireturnProfiles(clientID, token string, now time.Time) ([]wtProfile, int) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return wireturnProfilesForClient(s.cfg, clientID, token, now)
 }
 
 func (s *Supervisor) SubscriptionPath() string {
@@ -3359,6 +3385,31 @@ func subscriptionHandler(supervisor *Supervisor) http.Handler {
 			return
 		}
 
+		// WireTurn-format subscription: ?format=wireturn (JSON array) or
+		// ?format=wireturn-zip (zip of wt_<name>.json). Carries the vless half,
+		// so it is token-gated per-client (sub_token). Anything else falls
+		// through to the unchanged olcrtc text sub.
+		switch r.URL.Query().Get("format") {
+		case "wireturn", "wireturn-zip":
+			zip := r.URL.Query().Get("format") == "wireturn-zip"
+			profiles, status := supervisor.WireturnProfiles(clientID, r.URL.Query().Get("token"), time.Now())
+			if status == 404 {
+				http.NotFound(w, r)
+				return
+			}
+			if status == 401 {
+				http.Error(w, "unauthorized", http.StatusUnauthorized)
+				return
+			}
+			if zip {
+				writeWireturnZip(w, profiles)
+			} else {
+				w.Header().Set("Content-Type", "application/json; charset=utf-8")
+				_ = json.NewEncoder(w).Encode(profiles)
+			}
+			return
+		}
+
 		sub, ok := supervisor.SubscriptionForClient(clientID, time.Now())
 		if !ok {
 			http.NotFound(w, r)
@@ -3876,6 +3927,131 @@ func locationURI(loc Location) string {
 		loc.Endpoint.Key,
 		loc.Name,
 	)
+}
+
+// wtVlessConfig / wtProfile mirror the WireTurn import schema
+// (docs/generate_profiles.md) plus a top-level stable "uid" the fork uses to
+// match profiles across subscription refreshes.
+type wtVlessConfig struct {
+	VlessLink     string `json:"vlessLink"`
+	IsDualRoute   bool   `json:"isDualRoute"`
+	DirectAddress string `json:"directAddress,omitempty"`
+	HCInterval    string `json:"hcInterval,omitempty"`
+	Mux           string `json:"mux,omitempty"`
+}
+
+type wtProfile struct {
+	Uid          string         `json:"uid"`
+	Name         string         `json:"name"`
+	OlcrtcURL    string         `json:"olcrtcUrl"`
+	XrayEnabled  bool           `json:"xrayEnabled"`
+	XrayProtocol string         `json:"xrayProtocol,omitempty"`
+	VlessConfig  *wtVlessConfig `json:"vlessConfig,omitempty"`
+}
+
+// wireturnProfilesForClient builds WireTurn-format profiles (one per location)
+// for a client. Returns (profiles, httpStatus): 200 ok, 404 unknown/empty,
+// 401 token required-or-mismatch. On expiry/over-quota it returns an empty
+// slice with 200 (parity with the text sub dropping locations).
+func wireturnProfilesForClient(cfg Config, clientID, token string, now time.Time) ([]wtProfile, int) {
+	var client *Client
+	for i := range cfg.Clients {
+		if cfg.Clients[i].ClientID == clientID {
+			client = &cfg.Clients[i]
+			break
+		}
+	}
+	if client == nil || len(client.Locations) == 0 {
+		return nil, 404
+	}
+	// The WireTurn JSON may carry the vless credential -> require the per-client
+	// sub_token when configured (constant-time compare).
+	if client.SubToken != "" &&
+		subtle.ConstantTimeCompare([]byte(token), []byte(client.SubToken)) != 1 {
+		return nil, 401
+	}
+	if quotaStatus(client.Quota, now) != "active" {
+		return []wtProfile{}, 200
+	}
+	var vless *wtVlessConfig
+	if client.Vless != nil && strings.TrimSpace(client.Vless.Link) != "" {
+		dr := true
+		if client.Vless.DualRoute != nil {
+			dr = *client.Vless.DualRoute
+		}
+		hc := client.Vless.HCInterval
+		if hc == "" {
+			hc = "30"
+		}
+		mux := client.Vless.Mux
+		if mux == "" {
+			mux = "0"
+		}
+		vless = &wtVlessConfig{
+			VlessLink:     strings.TrimSpace(client.Vless.Link),
+			IsDualRoute:   dr,
+			DirectAddress: strings.TrimSpace(client.Vless.DirectAddress),
+			HCInterval:    hc,
+			Mux:           mux,
+		}
+	}
+	profiles := make([]wtProfile, 0, len(client.Locations))
+	for _, loc := range client.Locations {
+		p := wtProfile{
+			Uid:       wireturnUID(clientID, loc),
+			Name:      loc.Name,
+			OlcrtcURL: locationURI(loc),
+		}
+		if vless != nil {
+			p.XrayEnabled = true
+			p.XrayProtocol = "VLESS"
+			p.VlessConfig = vless
+		}
+		profiles = append(profiles, p)
+	}
+	return profiles, 200
+}
+
+// wireturnUID returns a stable per-location id surviving key/room rotation:
+// a persisted Location.Uid if set, else a deterministic fnv hash of
+// clientID+name+transport (rotation-stable; changes only on rename).
+func wireturnUID(clientID string, loc Location) string {
+	if strings.TrimSpace(loc.Uid) != "" {
+		return loc.Uid
+	}
+	h := fnv.New64a()
+	_, _ = h.Write([]byte(clientID + "\x00" + loc.Name + "\x00" + loc.Transport.Type))
+	return fmt.Sprintf("%016x", h.Sum64())
+}
+
+// writeWireturnZip emits a zip of wt_<name>.json entries (one profile object
+// each) — the form WireTurn's importProfilesFromZip consumes.
+func writeWireturnZip(w http.ResponseWriter, profiles []wtProfile) {
+	w.Header().Set("Content-Type", "application/zip")
+	zw := zip.NewWriter(w)
+	used := map[string]bool{}
+	for i, p := range profiles {
+		safe := strings.Map(func(r rune) rune {
+			if strings.ContainsRune("\\/:*?\"<>| ", r) {
+				return '_'
+			}
+			return r
+		}, p.Name)
+		if safe == "" {
+			safe = fmt.Sprintf("profile_%d", i+1)
+		}
+		entry := "wt_" + safe + ".json"
+		for n := 1; used[entry]; n++ {
+			entry = fmt.Sprintf("wt_%s_%d.json", safe, n)
+		}
+		used[entry] = true
+		fw, err := zw.Create(entry)
+		if err != nil {
+			continue
+		}
+		_ = json.NewEncoder(fw).Encode(p)
+	}
+	_ = zw.Close()
 }
 
 func payloadString(payload map[string]string) string {
