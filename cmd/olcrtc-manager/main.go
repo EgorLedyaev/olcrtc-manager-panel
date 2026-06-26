@@ -59,6 +59,12 @@ type Config struct {
 	SubscriptionPath string     `json:"subscription_path"`
 	PublicSubBase    string     `json:"public_sub_base,omitempty"`
 	Refresh          string     `json:"refresh,omitempty"`
+	// RotateEvery / RotateGrace drive the (default-disabled) autorotation of
+	// jitsi room+key per location. Intervals use the validateRefresh grammar
+	// (e.g. "30d", "7d"); empty or "0" disables. SHIP DORMANT: when set, the
+	// Rotator requires RotateEvery >> RotateGrace and RotateGrace >= 24h.
+	RotateEvery      string     `json:"rotate_every,omitempty"`
+	RotateGrace      string     `json:"rotate_grace,omitempty"`
 	ActiveLocationID string     `json:"active_location_id"`
 	Clients          []Client   `json:"clients"`
 	Locations        []Location `json:"-"`
@@ -83,6 +89,8 @@ func (c Config) MarshalJSON() ([]byte, error) {
 		SubscriptionPath string   `json:"subscription_path,omitempty"`
 		PublicSubBase    string   `json:"public_sub_base,omitempty"`
 		Refresh          string   `json:"refresh,omitempty"`
+		RotateEvery      string   `json:"rotate_every,omitempty"`
+		RotateGrace      string   `json:"rotate_grace,omitempty"`
 		ActiveLocationID string   `json:"active_location_id,omitempty"`
 		Clients          []Client `json:"clients"`
 	}
@@ -93,6 +101,8 @@ func (c Config) MarshalJSON() ([]byte, error) {
 		SubscriptionPath: c.SubscriptionPath,
 		PublicSubBase:    c.PublicSubBase,
 		Refresh:          c.Refresh,
+		RotateEvery:      c.RotateEvery,
+		RotateGrace:      c.RotateGrace,
 		ActiveLocationID: c.ActiveLocationID,
 		Clients:          c.Clients,
 	})
@@ -111,6 +121,10 @@ type Client struct {
 	// vless credential) requires ?token=<SubToken>. The olcrtc-only text sub is
 	// unaffected.
 	SubToken string `json:"sub_token,omitempty"`
+	// RotateEvery: optional per-client override of the global Config.RotateEvery
+	// autorotation cadence (same grammar). Empty = inherit the global value;
+	// "0" disables rotation for this client.
+	RotateEvery string `json:"rotate_every,omitempty"`
 }
 
 type VlessConfig struct {
@@ -142,6 +156,10 @@ type Location struct {
 	// Uid: stable per-location id for WireTurn-subscription matching; survives
 	// key/room rotation. Set once at creation; never rewritten by rotation.
 	Uid string `json:"uid,omitempty"`
+	// RotatedAt: RFC3339 timestamp of the last autorotation of this location's
+	// jitsi room/key. Written only by the Rotator (never by the admin); used as
+	// the age anchor for the next rotation.
+	RotatedAt string `json:"rotated_at,omitempty"`
 }
 
 type Endpoint struct {
@@ -312,8 +330,12 @@ type Supervisor struct {
 	cfg        Config
 	olcrtcPath string
 	processes  map[string]*process
-	start      starter
-	quota      *QuotaEnforcer
+	// lingering holds OLD location keys kept running during an autorotation
+	// grace window (so the OLD srv overlaps the NEW). A time.AfterFunc tears
+	// each down at grace end; the reload stop-loop skips keys present here.
+	lingering map[string]time.Time
+	start     starter
+	quota     *QuotaEnforcer
 }
 
 func main() {
@@ -367,6 +389,12 @@ func run() error {
 	}
 	defer supervisor.StopAll()
 	go quotaEnforcer.Run(ctx)
+
+	healthMonitor := NewHealthMonitor(configPath, supervisor)
+	go healthMonitor.Run(ctx)
+
+	rotator := NewRotator(configPath, supervisor)
+	go rotator.Run(ctx)
 
 	reloadc := make(chan os.Signal, 1)
 	signal.Notify(reloadc, syscall.SIGHUP)
@@ -445,6 +473,14 @@ func run() error {
 			return
 		}
 		writeJSON(w, collectMetrics(supervisor))
+	})))
+	handler.Handle("/api/health", adminAuth(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			w.Header().Set("Allow", http.MethodGet)
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		writeJSON(w, healthMonitor.Snapshot())
 	})))
 	handler.Handle("/api/audit", adminAuth(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
@@ -710,6 +746,7 @@ func NewSupervisor(olcrtcPath string, start starter) *Supervisor {
 	return &Supervisor{
 		olcrtcPath: olcrtcPath,
 		processes:  make(map[string]*process),
+		lingering:  make(map[string]time.Time),
 		start:      start,
 	}
 }
@@ -776,6 +813,12 @@ func (s *Supervisor) Reload(ctx context.Context, cfg Config) error {
 	}
 
 	for id, currentLoc := range current {
+		// A lingering OLD srv (autorotation grace) is intentionally absent from
+		// the next config; leave it to its time.AfterFunc teardown, do not stop
+		// it here (that would collapse the rotation overlap).
+		if _, lingering := s.lingering[id]; lingering {
+			continue
+		}
 		nextLoc, exists := next[id]
 		if !exists || !reflect.DeepEqual(currentLoc, nextLoc) {
 			s.stopLocked(id)
@@ -2894,7 +2937,15 @@ func quotaSafeName(value string) string {
 	return b.String()
 }
 
+// configWriteMu serializes ALL config writers (admin handlers, QuotaEnforcer,
+// and the autorotation Rotator) so their read-modify-write cycles cannot
+// interleave and lose updates. Held only across the in-process save; the
+// atomic temp+fsync+rename in writeConfig handles crash safety.
+var configWriteMu sync.Mutex
+
 func saveConfig(path string, cfg Config) error {
+	configWriteMu.Lock()
+	defer configWriteMu.Unlock()
 	backupConfig(path)
 	if err := writeConfig(path, cfg); err != nil {
 		return err
@@ -2904,6 +2955,8 @@ func saveConfig(path string, cfg Config) error {
 }
 
 func saveConfigWithoutBackup(path string, cfg Config) error {
+	configWriteMu.Lock()
+	defer configWriteMu.Unlock()
 	return writeConfig(path, cfg)
 }
 
