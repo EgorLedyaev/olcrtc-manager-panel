@@ -151,10 +151,10 @@ type olcrtcRuntimeConfig struct {
 }
 
 // olcrtcLivenessConfig tunes the post-handshake control-stream ping/pong,
-// emitted only into generated srv yamls (serverConfig). Set to 10s/20s/4
-// (loosened from 10s/5s/3): the 5s timeout reaped healthy clients on relayed
-// TURNS-TCP paths where the control ping is head-of-line blocked behind bulk
-// data, causing constant ~15-30s reconnects.
+// emitted only into generated srv yamls (serverConfig). Set generous
+// (15s/90s/3): on relayed TURNS-TCP paths the control ping is head-of-line
+// blocked behind bulk data and a pong older than Timeout is not counted, so a
+// tight timeout reaped healthy sessions. Genuine death is caught fast by WebRTC.
 type olcrtcLivenessConfig struct {
 	Interval string `yaml:"interval,omitempty"`
 	Timeout  string `yaml:"timeout,omitempty"`
@@ -1776,9 +1776,13 @@ func serverConfig(loc Location) (olcrtcRuntimeConfig, error) {
 		},
 		Data: loc.Data,
 	}
-	// WireTurn fork: emit a loosened liveness block so the server does not reap
-	// healthy clients on relayed (TURNS-TCP) paths. See olcrtcLivenessConfig.
-	cfg.Liveness = &olcrtcLivenessConfig{Interval: "10s", Timeout: "20s", Failures: 4}
+	// WireTurn fork: emit a generous liveness block so the server does not reap
+	// healthy clients on relayed (TURNS-TCP) paths. The control ping/pong shares
+	// the smux/SCTP path and is head-of-line blocked behind bulk data on a TCP
+	// relay; a late pong (older than Timeout) is NOT counted, so Timeout must
+	// exceed the worst round-trip under load. 90s gives huge headroom while
+	// genuine transport death is still caught fast by WebRTC PeerConnectionState.
+	cfg.Liveness = &olcrtcLivenessConfig{Interval: "15s", Timeout: "90s", Failures: 3}
 	if loc.Proxy.Addr != "" {
 		cfg.SOCKS = olcrtcSocksConfig{
 			ProxyAddr: loc.Proxy.Addr,
