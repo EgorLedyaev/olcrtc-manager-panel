@@ -329,7 +329,11 @@ func run() error {
 
 	cfg, err := loadConfig(configPath)
 	if err != nil {
-		return err
+		log.Printf("config %s unreadable (%v); attempting newest backup", configPath, err)
+		cfg, err = loadNewestBackup(configPath)
+		if err != nil {
+			return err
+		}
 	}
 	if port != 0 {
 		cfg.Port = port
@@ -1475,6 +1479,12 @@ func buildLocations(clientID string, requests []locationRequest) ([]Location, er
 		prefix := fmt.Sprintf("locations[%d]", i)
 		if req.RoomID == "" || req.RoomID == "any" {
 			return nil, fmt.Errorf("%s.room_id must be concrete", prefix)
+		}
+		if strings.ContainsAny(req.RoomID, " \t\r\n@#?$&<>") {
+			return nil, fmt.Errorf("%s.room_id must not contain spaces or any of @ # ? $ & < >", prefix)
+		}
+		if strings.ContainsAny(req.Name, "\r\n") {
+			return nil, fmt.Errorf("%s.name must not contain newlines", prefix)
 		}
 		if err := validateRequestKey(req.Key); err != nil {
 			return nil, fmt.Errorf("%s.key: %w", prefix, err)
@@ -2753,9 +2763,23 @@ func writeConfig(path string, cfg Config) error {
 	if err != nil {
 		return fmt.Errorf("marshal config: %w", err)
 	}
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, append(data, '\n'), 0o600); err != nil {
+	dir := filepath.Dir(path)
+	f, err := os.CreateTemp(dir, ".config-*.json.tmp")
+	if err != nil {
+		return fmt.Errorf("create temp config: %w", err)
+	}
+	tmp := f.Name()
+	defer func() { _ = os.Remove(tmp) }() // no-op once renamed
+	if _, err := f.Write(append(data, '\n')); err != nil {
+		_ = f.Close()
 		return fmt.Errorf("write temp config: %w", err)
+	}
+	if err := f.Sync(); err != nil {
+		_ = f.Close()
+		return fmt.Errorf("sync temp config: %w", err)
+	}
+	if err := f.Close(); err != nil {
+		return fmt.Errorf("close temp config: %w", err)
 	}
 	if err := os.Rename(tmp, path); err != nil {
 		return fmt.Errorf("replace config: %w", err)
@@ -2774,6 +2798,48 @@ func backupConfig(path string) {
 	}
 	name := "config-" + time.Now().UTC().Format("20060102-150405") + ".json"
 	_ = os.WriteFile(filepath.Join(dir, name), data, 0o600)
+	if ents, err := os.ReadDir(dir); err == nil {
+		var bk []string
+		for _, e := range ents {
+			if !e.IsDir() && strings.HasPrefix(e.Name(), "config-") && strings.HasSuffix(e.Name(), ".json") {
+				bk = append(bk, e.Name())
+			}
+		}
+		sort.Strings(bk)
+		for len(bk) > 30 {
+			_ = os.Remove(filepath.Join(dir, bk[0]))
+			bk = bk[1:]
+		}
+	}
+}
+
+func loadNewestBackup(path string) (Config, error) {
+	dir := filepath.Join(filepath.Dir(path), "backups")
+	ents, err := os.ReadDir(dir)
+	if err != nil {
+		return Config{}, fmt.Errorf("no backups available: %w", err)
+	}
+	names := make([]string, 0, len(ents))
+	for _, e := range ents {
+		if !e.IsDir() && strings.HasPrefix(e.Name(), "config-") && strings.HasSuffix(e.Name(), ".json") {
+			names = append(names, e.Name())
+		}
+	}
+	if len(names) == 0 {
+		return Config{}, errors.New("no config backups found")
+	}
+	sort.Strings(names)
+	for i := len(names) - 1; i >= 0; i-- {
+		candidate := filepath.Join(dir, names[i])
+		cfg, err := loadConfig(candidate)
+		if err != nil {
+			log.Printf("backup %s also unreadable (%v); trying older", candidate, err)
+			continue
+		}
+		log.Printf("restored config from backup %s", candidate)
+		return cfg, nil
+	}
+	return Config{}, errors.New("no usable config backup found")
 }
 
 func appendAudit(configPath, action, detail string) {
