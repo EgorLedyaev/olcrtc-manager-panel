@@ -146,6 +146,19 @@ type olcrtcRuntimeConfig struct {
 	Data   string             `yaml:"data,omitempty"`
 	Debug  bool               `yaml:"debug,omitempty"`
 	FFmpeg string             `yaml:"ffmpeg,omitempty"`
+
+	Liveness *olcrtcLivenessConfig `yaml:"liveness,omitempty"`
+}
+
+// olcrtcLivenessConfig tunes the post-handshake control-stream ping/pong,
+// emitted only into generated srv yamls (serverConfig). Set to 10s/20s/4
+// (loosened from 10s/5s/3): the 5s timeout reaped healthy clients on relayed
+// TURNS-TCP paths where the control ping is head-of-line blocked behind bulk
+// data, causing constant ~15-30s reconnects.
+type olcrtcLivenessConfig struct {
+	Interval string `yaml:"interval,omitempty"`
+	Timeout  string `yaml:"timeout,omitempty"`
+	Failures int    `yaml:"failures,omitempty"`
 }
 
 type olcrtcAuthConfig struct {
@@ -894,23 +907,40 @@ func (s *Supervisor) Restart(ctx context.Context, clientID, roomID, transport st
 	return nil
 }
 
+// healthyResetWindow: if a srv process stayed up at least this long before
+// exiting, its restart counter is forgotten (a single flap after hours of
+// uptime should not count toward backoff).
+const healthyResetWindow = 120 * time.Second
+
+// maxRestartBackoffSecs caps the exponential restart backoff.
+const maxRestartBackoffSecs = 30
+
 func (s *Supervisor) monitorProcess(ctx context.Context, key string, p *process) {
 	go func() {
+		monStart := time.Now()
 		err := <-p.done
+		ranFor := time.Since(monStart)
 		if ctx.Err() != nil {
 			return
 		}
 		if err != nil {
 			log.Printf("olcrtc for %s exited: %v", key, err)
 		}
-		time.Sleep(time.Duration(min(p.restarts+1, 5)) * time.Second)
+		// WireTurn fork: never give up restarting (upstream stopped after 3
+		// flaps, leaving the tunnel permanently dead). Reset the counter after a
+		// healthy run; exponential backoff capped at maxRestartBackoffSecs.
+		restarts := p.restarts
+		if ranFor >= healthyResetWindow {
+			restarts = 0
+		}
+		backoff := 1 << uint(min(restarts, 5))
+		if backoff > maxRestartBackoffSecs {
+			backoff = maxRestartBackoffSecs
+		}
+		time.Sleep(time.Duration(backoff) * time.Second)
 		s.mu.Lock()
 		defer s.mu.Unlock()
 		if s.processes[key] != p || ctx.Err() != nil {
-			return
-		}
-		if p.restarts >= 3 {
-			log.Printf("olcrtc for %s reached restart limit", key)
 			return
 		}
 		next, startErr := s.start(ctx, s.olcrtcPath, p.location)
@@ -919,7 +949,7 @@ func (s *Supervisor) monitorProcess(ctx context.Context, key string, p *process)
 			return
 		}
 		s.registerQuotaLocked(p.location, s.clientQuotaLocked(p.location.ClientID), next)
-		next.restarts = p.restarts + 1
+		next.restarts = restarts + 1
 		s.processes[key] = next
 		s.monitorProcess(ctx, key, next)
 	}()
@@ -1746,6 +1776,9 @@ func serverConfig(loc Location) (olcrtcRuntimeConfig, error) {
 		},
 		Data: loc.Data,
 	}
+	// WireTurn fork: emit a loosened liveness block so the server does not reap
+	// healthy clients on relayed (TURNS-TCP) paths. See olcrtcLivenessConfig.
+	cfg.Liveness = &olcrtcLivenessConfig{Interval: "10s", Timeout: "20s", Failures: 4}
 	if loc.Proxy.Addr != "" {
 		cfg.SOCKS = olcrtcSocksConfig{
 			ProxyAddr: loc.Proxy.Addr,
