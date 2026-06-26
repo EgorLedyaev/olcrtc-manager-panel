@@ -3984,7 +3984,19 @@ func subscriptionForLocations(name, refresh string, locations []Location, quota 
 }
 
 func locationURI(loc Location) string {
-	payload := payloadString(loc.Transport.Payload)
+	// Carry the per-location DNS in the olcrtc payload so the client uses the
+	// admin's DNS (e.g. 77.88.8.8) instead of its built-in default. olcrtc clients
+	// ignore unknown payload keys, so this stays backward-compatible.
+	payloadMap := loc.Transport.Payload
+	if strings.TrimSpace(loc.DNS) != "" {
+		merged := make(map[string]string, len(payloadMap)+1)
+		for k, v := range payloadMap {
+			merged[k] = v
+		}
+		merged["dns"] = loc.DNS
+		payloadMap = merged
+	}
+	payload := payloadString(payloadMap)
 	return fmt.Sprintf("olcrtc://%s?%s%s@%s#%s$%s",
 		loc.Carrier,
 		loc.Transport.Type,
