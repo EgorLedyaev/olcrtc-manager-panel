@@ -2,6 +2,7 @@ import React, { useEffect, useState } from "react";
 import { createRoot } from "react-dom/client";
 import {
   Activity,
+  Check,
   ChevronDown,
   ChevronRight,
   Copy,
@@ -9,15 +10,18 @@ import {
   KeyRound,
   LogOut,
   Lock,
+  Network,
   Plus,
   RefreshCw,
   Server,
   Settings,
   Terminal,
   Trash2,
+  UserPlus,
   Users,
   X,
 } from "lucide-react";
+import QRCode from "qrcode";
 import "./index.css";
 
 type LocationState = {
@@ -156,6 +160,23 @@ type SettingsForm = {
   refresh: string;
 };
 
+type FriendForm = {
+  client_id: string;
+  name: string;
+  vless_link: string;
+  dual_route: boolean;
+};
+
+type FriendResult = {
+  client_id: string;
+  olcrtc_uri: string;
+  sub_token: string;
+  subscription_url: string;
+  deep_link: string;
+};
+
+type RouteHealthLevel = "connected" | "idle" | "starting" | "flapping" | "down" | "stopped";
+
 const DEFAULT_JITSI_INSTANCE = "https://meet.handyweb.org";
 
 function splitJitsiRoomId(roomId: string): { instance: string; room: string } {
@@ -204,6 +225,13 @@ const defaultSettingsForm: SettingsForm = {
   port: "",
   subscription_path: "sub",
   refresh: "",
+};
+
+const defaultFriendForm: FriendForm = {
+  client_id: "",
+  name: "",
+  vless_link: "",
+  dual_route: true,
 };
 
 const payloadFields: Record<string, Array<{ key: string; label: string; defaultValue: string }>> = {
@@ -397,6 +425,103 @@ function clientSummary(client: ClientState, running: number) {
   const parts = [`${client.locations.length} локац.`, `${running} running`, quotaText(client.quota)];
   if (client.refresh) parts.push(`refresh ${client.refresh}`);
   return parts.join(" · ");
+}
+
+const ROUTE_HEALTH: Record<RouteHealthLevel, { label: string; badge: string; dot: string }> = {
+  connected: { label: "Connected", badge: "bg-primary/15 text-primary", dot: "bg-primary" },
+  idle: { label: "Idle", badge: "bg-sky-500/15 text-sky-400", dot: "bg-sky-400" },
+  starting: { label: "Starting", badge: "bg-amber-500/15 text-amber-400", dot: "bg-amber-400" },
+  flapping: { label: "Flapping", badge: "bg-amber-500/15 text-amber-400", dot: "bg-amber-400" },
+  down: { label: "Down", badge: "bg-destructive/15 text-destructive", dot: "bg-destructive" },
+  stopped: { label: "Stopped", badge: "bg-muted text-muted-foreground", dot: "bg-muted-foreground" },
+};
+
+// routeHealth derives a colored badge purely from existing /api/state runtime fields.
+// Rule: an idle route or one with peer_count == 0 is NEVER red — red (Down) requires an
+// explicit failure signal (exit_error or a crash/error/fail status while not running).
+function routeHealthLevel(loc: LocationState): RouteHealthLevel {
+  const rt = loc.runtime;
+  const status = (rt.status ?? "").toLowerCase();
+  const peers = rt.peer_count ?? 0;
+  const restarts = rt.restarts ?? 0;
+
+  if (rt.running) {
+    if (peers > 0) return "connected";
+    if (/(start|connect|init|dial|boot|launch)/.test(status)) return "starting";
+    if (restarts >= 3) return "flapping";
+    return "idle";
+  }
+
+  if (rt.exit_error || /(crash|error|fail|panic)/.test(status)) return "down";
+  return "stopped";
+}
+
+function routeHealth(loc: LocationState) {
+  return ROUTE_HEALTH[routeHealthLevel(loc)];
+}
+
+function RouteHealthSummary({ clients }: { clients: ClientState[] }) {
+  const counts: Record<RouteHealthLevel, number> = {
+    connected: 0,
+    idle: 0,
+    starting: 0,
+    flapping: 0,
+    down: 0,
+    stopped: 0,
+  };
+  for (const client of clients) {
+    for (const loc of client.locations) counts[routeHealthLevel(loc)] += 1;
+  }
+  const order: RouteHealthLevel[] = ["connected", "idle", "starting", "flapping", "down", "stopped"];
+  const shown = order.filter((level) => counts[level] > 0);
+  if (shown.length === 0) return <span className="text-muted-foreground">—</span>;
+  return (
+    <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-base">
+      {shown.map((level) => {
+        const meta = ROUTE_HEALTH[level];
+        return (
+          <span key={level} className="inline-flex items-center gap-1.5" title={meta.label}>
+            <span className={`h-2 w-2 rounded-full ${meta.dot}`} />
+            {counts[level]}
+          </span>
+        );
+      })}
+    </div>
+  );
+}
+
+function CopyField({ label, value }: { label: string; value: string }) {
+  const [copied, setCopied] = useState(false);
+  const copy = async () => {
+    try {
+      await copyText(value);
+      setCopied(true);
+      window.setTimeout(() => setCopied(false), 1500);
+    } catch {
+      /* clipboard unavailable */
+    }
+  };
+  return (
+    <label className="grid gap-2 text-sm text-muted-foreground">
+      {label}
+      <div className="flex gap-2">
+        <input
+          readOnly
+          value={value}
+          onFocus={(event) => event.currentTarget.select()}
+          className="h-10 flex-1 rounded-md border border-border bg-background px-3 font-mono text-xs text-foreground outline-none focus:border-primary"
+        />
+        <button
+          type="button"
+          onClick={copy}
+          className="inline-flex h-10 items-center gap-2 rounded-md border border-primary bg-secondary px-3 text-xs font-medium text-primary hover:bg-primary/10"
+        >
+          {copied ? <Check className="h-4 w-4" /> : <Copy className="h-4 w-4" />}
+          {copied ? "Скопировано" : "Копировать"}
+        </button>
+      </div>
+    </label>
+  );
 }
 
 function StatCard({
@@ -1180,6 +1305,11 @@ function App() {
   const [settingsForm, setSettingsForm] = useState<SettingsForm>(defaultSettingsForm);
   const [passwordForm, setPasswordForm] = useState({ current: "", next: "", repeat: "" });
   const [expandedClients, setExpandedClients] = useState<Record<string, boolean>>({});
+  const [friendOpen, setFriendOpen] = useState(false);
+  const [friendForm, setFriendForm] = useState<FriendForm>(defaultFriendForm);
+  const [friendResult, setFriendResult] = useState<FriendResult | null>(null);
+  const [friendQr, setFriendQr] = useState("");
+  const [friendError, setFriendError] = useState("");
 
   const checkAuth = async () => {
     try {
@@ -1284,6 +1414,58 @@ function App() {
   const openCreate = () => {
     setCreateForm(normalizeForm({ ...defaultForm, locations: [{ ...defaultLocationForm }] }));
     setCreateOpen(true);
+  };
+
+  const openFriend = () => {
+    setFriendForm({ ...defaultFriendForm });
+    setFriendResult(null);
+    setFriendQr("");
+    setFriendError("");
+    setFriendOpen(true);
+  };
+
+  const closeFriend = () => {
+    setFriendOpen(false);
+    setFriendResult(null);
+    setFriendQr("");
+    setFriendError("");
+  };
+
+  const submitFriend = async () => {
+    setFriendError("");
+    if (!friendForm.client_id.trim()) {
+      setFriendError("Укажи ID друга");
+      return;
+    }
+    setBusy(true);
+    try {
+      const res = await request("/api/friends", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          client_id: friendForm.client_id.trim(),
+          name: friendForm.name.trim() || undefined,
+          vless_link: friendForm.vless_link.trim() || undefined,
+          dual_route: friendForm.dual_route,
+        }),
+      });
+      const body = (await res.json()) as FriendResult;
+      setFriendResult(body);
+      try {
+        // QR is rendered locally from the deep link — the token never leaves the browser.
+        setFriendQr(await QRCode.toDataURL(body.deep_link, { width: 256, margin: 1 }));
+      } catch {
+        setFriendQr("");
+      }
+      setNotice(`Друг ${body.client_id} добавлен`);
+      await loadState();
+      await loadMetrics();
+      await loadAudit();
+    } catch (err) {
+      setFriendError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setBusy(false);
+    }
   };
 
   const openEdit = (client: ClientState) => {
@@ -1600,11 +1782,12 @@ function App() {
       </header>
 
       <main className="mx-auto max-w-7xl px-5 py-6">
-        <section className="grid gap-3 md:grid-cols-4">
+        <section className="grid gap-3 md:grid-cols-5">
           <StatCard icon={<Server className="h-4 w-4" />} label="Профиль" value={state?.name ?? "..."} />
           <StatCard icon={<Users className="h-4 w-4" />} label="Клиенты" value={state?.client_count ?? "..."} />
           <StatCard icon={<Activity className="h-4 w-4" />} label="Инстансы" value={state?.running_count ?? "..."} />
           <StatCard icon={<Users className="h-4 w-4" />} label="Peers" value={state?.peer_count ?? "..."} />
+          <StatCard icon={<Network className="h-4 w-4" />} label="Маршруты" value={<RouteHealthSummary clients={clients} />} />
         </section>
 
         <section className="mt-4 rounded-lg border border-border bg-card p-4">
@@ -1613,6 +1796,13 @@ function App() {
               <h2 className="text-lg font-semibold tracking-normal">Клиенты</h2>
             </div>
             <div className="flex flex-wrap gap-2">
+              <button
+                className="inline-flex h-9 items-center gap-2 rounded-md border border-primary bg-secondary px-3 text-sm font-medium text-primary hover:bg-primary/10"
+                onClick={openFriend}
+              >
+                <UserPlus className="h-4 w-4" />
+                Добавить друга
+              </button>
               <button
                 className="inline-flex h-9 items-center gap-2 rounded-md bg-primary px-3 text-sm font-medium text-black hover:bg-primary/90"
                 onClick={openCreate}
@@ -1719,13 +1909,18 @@ function App() {
                                 <td className="py-3 pr-3">{loc.transport}</td>
                                 <td className="py-3 pr-3 text-muted-foreground">{loc.dns}</td>
                                 <td className="py-3 pr-3">
-                                  <span
-                                    className={`inline-flex rounded-full px-2 py-1 text-xs ${
-                                      loc.runtime.running ? "bg-primary/15 text-primary" : "bg-destructive/15 text-destructive"
-                                    }`}
-                                  >
-                                    {loc.runtime.status}
-                                  </span>
+                                  {(() => {
+                                    const health = routeHealth(loc);
+                                    return (
+                                      <span
+                                        className={`inline-flex items-center gap-1.5 rounded-full px-2 py-1 text-xs ${health.badge}`}
+                                        title={`${health.label}: ${loc.runtime.status}`}
+                                      >
+                                        <span className={`h-1.5 w-1.5 rounded-full ${health.dot}`} />
+                                        {loc.runtime.status || health.label}
+                                      </span>
+                                    );
+                                  })()}
                                 </td>
                                 <td className="py-3 pr-3 text-muted-foreground" title={loc.runtime.peer_devices?.join(", ")}>
                                   {loc.runtime.peer_count ?? "-"}
@@ -1815,6 +2010,125 @@ function App() {
                 Создать
               </button>
             </div>
+          </div>
+        </Modal>
+      )}
+
+      {friendOpen && (
+        <Modal title="Добавить друга" onClose={closeFriend}>
+          <div className="p-5">
+            {friendResult ? (
+              <div className="grid gap-4">
+                <div className="rounded-md border border-primary/40 bg-primary/10 p-3 text-sm text-foreground">
+                  Друг <span className="font-semibold">{friendResult.client_id}</span> создан. Передай ссылку или QR-код.
+                </div>
+                {friendQr ? (
+                  <div className="grid justify-items-center gap-2">
+                    <img className="h-64 w-64 rounded-md bg-white p-2" src={friendQr} alt="QR deep link" />
+                    <div className="text-xs text-muted-foreground">QR сформирован локально (deep link)</div>
+                  </div>
+                ) : (
+                  <div className="rounded-md border border-border bg-background p-3 text-xs text-muted-foreground">
+                    Не удалось сформировать QR-код, используй ссылку ниже.
+                  </div>
+                )}
+                <CopyField label="Subscription URL" value={friendResult.subscription_url} />
+                <CopyField label="Deep link" value={friendResult.deep_link} />
+                <CopyField label="OlcRTC URI" value={friendResult.olcrtc_uri} />
+                <CopyField label="Sub token" value={friendResult.sub_token} />
+                <div className="mt-1 flex justify-end gap-2">
+                  <button
+                    className="h-9 rounded-md border border-border bg-muted px-3 text-sm hover:bg-muted/80"
+                    onClick={openFriend}
+                  >
+                    Добавить ещё
+                  </button>
+                  <button
+                    className="inline-flex h-9 items-center gap-2 rounded-md bg-primary px-3 text-sm font-medium text-black hover:bg-primary/90"
+                    onClick={closeFriend}
+                  >
+                    <Check className="h-4 w-4" />
+                    Готово
+                  </button>
+                </div>
+              </div>
+            ) : (
+              <div className="grid gap-4">
+                <label className="grid gap-2 text-sm text-muted-foreground">
+                  ID друга
+                  <div className="flex gap-2">
+                    <input
+                      className="h-10 flex-1 rounded-md border border-border bg-background px-3 text-foreground outline-none focus:border-primary"
+                      value={friendForm.client_id}
+                      onChange={(event) => setFriendForm({ ...friendForm, client_id: event.target.value })}
+                      placeholder="client-id"
+                    />
+                    <button
+                      className="inline-flex h-10 items-center rounded-md border border-primary bg-secondary px-3 text-xs font-medium text-primary hover:bg-primary/10"
+                      type="button"
+                      onClick={() => {
+                        const ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+                        const bytes = new Uint8Array(21);
+                        crypto.getRandomValues(bytes);
+                        let client_id = "";
+                        for (let i = 0; i < bytes.length; i++) client_id += ALPHABET[bytes[i] % 62];
+                        setFriendForm({ ...friendForm, client_id });
+                      }}
+                    >
+                      Generate
+                    </button>
+                  </div>
+                </label>
+                <label className="grid gap-2 text-sm text-muted-foreground">
+                  Имя (необязательно)
+                  <input
+                    className="h-10 rounded-md border border-border bg-background px-3 text-foreground outline-none focus:border-primary"
+                    value={friendForm.name}
+                    onChange={(event) => setFriendForm({ ...friendForm, name: event.target.value })}
+                    placeholder="Например, Vasya"
+                  />
+                </label>
+                <label className="grid gap-2 text-sm text-muted-foreground">
+                  VLESS ссылка (необязательно)
+                  <input
+                    className="h-10 rounded-md border border-border bg-background px-3 font-mono text-xs text-foreground outline-none focus:border-primary"
+                    value={friendForm.vless_link}
+                    onChange={(event) => setFriendForm({ ...friendForm, vless_link: event.target.value })}
+                    placeholder="vless://..."
+                  />
+                </label>
+                <label className="flex items-center gap-3 rounded-md border border-border bg-background p-3 text-sm text-foreground">
+                  <input
+                    type="checkbox"
+                    className="h-4 w-4 accent-primary"
+                    checked={friendForm.dual_route}
+                    onChange={(event) => setFriendForm({ ...friendForm, dual_route: event.target.checked })}
+                  />
+                  <span>Dual-route (авто-переключение VLESS ↔ olcrtc)</span>
+                </label>
+                {friendError && (
+                  <div className="rounded-md border border-destructive/40 bg-destructive/10 p-3 text-sm text-destructive">
+                    {friendError}
+                  </div>
+                )}
+                <div className="mt-1 flex justify-end gap-2">
+                  <button
+                    className="h-9 rounded-md border border-border bg-muted px-3 text-sm hover:bg-muted/80"
+                    onClick={closeFriend}
+                  >
+                    Отмена
+                  </button>
+                  <button
+                    className="inline-flex h-9 items-center gap-2 rounded-md bg-primary px-3 text-sm font-medium text-black hover:bg-primary/90 disabled:opacity-60"
+                    disabled={busy}
+                    onClick={submitFriend}
+                  >
+                    <UserPlus className="h-4 w-4" />
+                    Добавить
+                  </button>
+                </div>
+              </div>
+            )}
           </div>
         </Modal>
       )}
