@@ -334,8 +334,15 @@ type Supervisor struct {
 	// grace window (so the OLD srv overlaps the NEW). A time.AfterFunc tears
 	// each down at grace end; the reload stop-loop skips keys present here.
 	lingering map[string]time.Time
-	start     starter
-	quota     *QuotaEnforcer
+	// restarting holds keys whose entry is transiently absent from processes
+	// during Restart()'s unlocked stop-then-start window; the self-heal sweep
+	// must not treat these as missing and double-start them.
+	restarting map[string]struct{}
+	// stopped is set by StopAll so a reconcile tick racing teardown never
+	// re-spawns children after shutdown.
+	stopped bool
+	start   starter
+	quota   *QuotaEnforcer
 }
 
 func main() {
@@ -395,6 +402,21 @@ func run() error {
 
 	rotator := NewRotator(configPath, supervisor)
 	go rotator.Run(ctx)
+
+	// Self-heal sweep: guarantees a dead location is restarted even if the
+	// per-process monitor's edge-triggered restart silently fails.
+	go func() {
+		t := time.NewTicker(reconcileTickInterval)
+		defer t.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-t.C:
+				supervisor.Reconcile(ctx, time.Now())
+			}
+		}
+	}()
 
 	reloadc := make(chan os.Signal, 1)
 	signal.Notify(reloadc, syscall.SIGHUP)
@@ -747,6 +769,7 @@ func NewSupervisor(olcrtcPath string, start starter) *Supervisor {
 		olcrtcPath: olcrtcPath,
 		processes:  make(map[string]*process),
 		lingering:  make(map[string]time.Time),
+		restarting: make(map[string]struct{}),
 		start:      start,
 	}
 }
@@ -836,6 +859,7 @@ func (s *Supervisor) Reload(ctx context.Context, cfg Config) error {
 func (s *Supervisor) StopAll() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.stopped = true
 	if s.quota != nil {
 		for id := range s.processes {
 			s.quota.Unregister(id)
@@ -989,14 +1013,19 @@ func (s *Supervisor) Restart(ctx context.Context, clientID, roomID, transport st
 	}
 	loc := p.location
 	s.stopLocked(key)
+	s.restarting[key] = struct{}{} // the self-heal sweep must not resurrect this key mid-restart
 	s.mu.Unlock()
 
-	if err := waitProcessStopped(ctx, p, 5*time.Second); err != nil {
-		return err
-	}
+	waitErr := waitProcessStopped(ctx, p, 5*time.Second)
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	delete(s.restarting, key)
+	if waitErr != nil {
+		// Old process didn't stop in time; leave the key absent so the next
+		// self-heal sweep recovers it rather than abandoning the location.
+		return waitErr
+	}
 	next, err := s.start(context.Background(), s.olcrtcPath, loc)
 	if err != nil {
 		return err
@@ -1053,6 +1082,75 @@ func (s *Supervisor) monitorProcess(ctx context.Context, key string, p *process)
 		s.processes[key] = next
 		s.monitorProcess(ctx, key, next)
 	}()
+}
+
+// Self-heal: a level-triggered safety net complementing the per-process monitor
+// (which is edge-triggered and, in rare cases, can fail to restart a dead
+// location — e.g. a wedged monitor goroutine, the exact failure that left a
+// location Down for hours). reconcileTickInterval sets the sweep cadence;
+// selfHealGrace keeps us from fighting the monitor's normal restart backoff on a
+// fresh exit — we only step in once a location has stayed dead clearly longer
+// than the max backoff.
+const (
+	reconcileTickInterval = 30 * time.Second
+	selfHealGrace         = 90 * time.Second
+)
+
+// Reconcile (re)starts any quota-active, non-lingering location whose process is
+// missing or has stayed dead past selfHealGrace. It is idempotent and
+// lock-serialized with monitorProcess: if both try to restart the same key, the
+// monitor's identity guard (s.processes[key] != p) prevents a double start.
+func (s *Supervisor) Reconcile(ctx context.Context, now time.Time) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	// Never resurrect children once we are tearing down: a tick can race the
+	// deferred StopAll (and on the signal path ctx is already cancelled).
+	if s.stopped || ctx.Err() != nil {
+		return
+	}
+	for _, loc := range activeLocations(s.cfg, now) {
+		key := locationKey(loc)
+		if _, lingering := s.lingering[key]; lingering {
+			continue
+		}
+		// A manual Restart leaves the key transiently absent while it waits for
+		// the old process to die; don't double-start it.
+		if _, restarting := s.restarting[key]; restarting {
+			continue
+		}
+		priorRestarts := 0
+		if p, exists := s.processes[key]; exists {
+			st := p.state()
+			if st.Running {
+				continue
+			}
+			// How long has it been dead? Prefer ExitedAt; fall back to StartedAt
+			// so an anomalous running=false-without-exit entry still gets the
+			// grace window instead of an immediate restart. Within grace, leave
+			// it to the per-process monitor's backoff (we don't fight it).
+			ref := st.ExitedAt
+			if ref == "" {
+				ref = st.StartedAt
+			}
+			if ref != "" {
+				if t, err := time.Parse(time.RFC3339, ref); err == nil && now.Sub(t) < selfHealGrace {
+					continue
+				}
+			}
+			priorRestarts = st.Restarts
+			s.stopLocked(key) // clear quota accounting + drop the stale entry
+		}
+		next, err := s.start(ctx, s.olcrtcPath, loc)
+		if err != nil {
+			log.Printf("self-heal: restart for %s failed: %v", key, err)
+			continue
+		}
+		s.registerQuotaLocked(loc, quotaForClient(s.cfg, loc.ClientID), next)
+		next.restarts = priorRestarts + 1 // preserve backoff history across self-heal
+		s.processes[key] = next
+		s.monitorProcess(ctx, key, next)
+		log.Printf("self-heal: restarted dead location %s (restarts=%d)", key, next.restarts)
+	}
 }
 
 func (s *Supervisor) registerQuotaLocked(loc Location, quota Quota, p *process) {
