@@ -8,6 +8,7 @@ import (
 	"crypto/rand"
 	"crypto/subtle"
 	"embed"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -18,6 +19,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -45,13 +47,24 @@ var adminConfigPath string
 
 const defaultGeneratedJitsiBase = "https://meet.handyweb.org"
 
+// Friend-facing base for subscription URLs returned by POST /api/friends, when
+// Config.PublicSubBase is unset. Points at the nginx /wtsub/ alias for this deployment.
+const defaultPublicSubBase = "https://api-gateway-service.top:2764/wtsub"
+
 type Config struct {
 	Version          int        `json:"version"`
 	LegacyVersion    int        `json:"vesion"`
 	Name             string     `json:"name"`
 	Port             int        `json:"port"`
 	SubscriptionPath string     `json:"subscription_path"`
+	PublicSubBase    string     `json:"public_sub_base,omitempty"`
 	Refresh          string     `json:"refresh,omitempty"`
+	// RotateEvery / RotateGrace drive the (default-disabled) autorotation of
+	// jitsi room+key per location. Intervals use the validateRefresh grammar
+	// (e.g. "30d", "7d"); empty or "0" disables. SHIP DORMANT: when set, the
+	// Rotator requires RotateEvery >> RotateGrace and RotateGrace >= 24h.
+	RotateEvery      string     `json:"rotate_every,omitempty"`
+	RotateGrace      string     `json:"rotate_grace,omitempty"`
 	ActiveLocationID string     `json:"active_location_id"`
 	Clients          []Client   `json:"clients"`
 	Locations        []Location `json:"-"`
@@ -74,7 +87,10 @@ func (c Config) MarshalJSON() ([]byte, error) {
 		Name             string   `json:"name"`
 		Port             int      `json:"port"`
 		SubscriptionPath string   `json:"subscription_path,omitempty"`
+		PublicSubBase    string   `json:"public_sub_base,omitempty"`
 		Refresh          string   `json:"refresh,omitempty"`
+		RotateEvery      string   `json:"rotate_every,omitempty"`
+		RotateGrace      string   `json:"rotate_grace,omitempty"`
 		ActiveLocationID string   `json:"active_location_id,omitempty"`
 		Clients          []Client `json:"clients"`
 	}
@@ -83,7 +99,10 @@ func (c Config) MarshalJSON() ([]byte, error) {
 		Name:             c.Name,
 		Port:             c.Port,
 		SubscriptionPath: c.SubscriptionPath,
+		PublicSubBase:    c.PublicSubBase,
 		Refresh:          c.Refresh,
+		RotateEvery:      c.RotateEvery,
+		RotateGrace:      c.RotateGrace,
 		ActiveLocationID: c.ActiveLocationID,
 		Clients:          c.Clients,
 	})
@@ -102,6 +121,10 @@ type Client struct {
 	// vless credential) requires ?token=<SubToken>. The olcrtc-only text sub is
 	// unaffected.
 	SubToken string `json:"sub_token,omitempty"`
+	// RotateEvery: optional per-client override of the global Config.RotateEvery
+	// autorotation cadence (same grammar). Empty = inherit the global value;
+	// "0" disables rotation for this client.
+	RotateEvery string `json:"rotate_every,omitempty"`
 }
 
 type VlessConfig struct {
@@ -133,6 +156,14 @@ type Location struct {
 	// Uid: stable per-location id for WireTurn-subscription matching; survives
 	// key/room rotation. Set once at creation; never rewritten by rotation.
 	Uid string `json:"uid,omitempty"`
+	// RotatedAt: RFC3339 timestamp of the last autorotation of this location's
+	// jitsi room/key. Written only by the Rotator (never by the admin); used as
+	// the age anchor for the next rotation.
+	RotatedAt string `json:"rotated_at,omitempty"`
+	// Backup marks this location as a failover alternate rather than a primary.
+	// Primaries are emitted as their own WireTurn profile; backups are attached
+	// to the primary profile(s) as olcrtcAlternates for client-side auto-failover.
+	Backup bool `json:"backup,omitempty"`
 }
 
 type Endpoint struct {
@@ -303,8 +334,19 @@ type Supervisor struct {
 	cfg        Config
 	olcrtcPath string
 	processes  map[string]*process
-	start      starter
-	quota      *QuotaEnforcer
+	// lingering holds OLD location keys kept running during an autorotation
+	// grace window (so the OLD srv overlaps the NEW). A time.AfterFunc tears
+	// each down at grace end; the reload stop-loop skips keys present here.
+	lingering map[string]time.Time
+	// restarting holds keys whose entry is transiently absent from processes
+	// during Restart()'s unlocked stop-then-start window; the self-heal sweep
+	// must not treat these as missing and double-start them.
+	restarting map[string]struct{}
+	// stopped is set by StopAll so a reconcile tick racing teardown never
+	// re-spawns children after shutdown.
+	stopped bool
+	start   starter
+	quota   *QuotaEnforcer
 }
 
 func main() {
@@ -329,7 +371,11 @@ func run() error {
 
 	cfg, err := loadConfig(configPath)
 	if err != nil {
-		return err
+		log.Printf("config %s unreadable (%v); attempting newest backup", configPath, err)
+		cfg, err = loadNewestBackup(configPath)
+		if err != nil {
+			return err
+		}
 	}
 	if port != 0 {
 		cfg.Port = port
@@ -354,6 +400,27 @@ func run() error {
 	}
 	defer supervisor.StopAll()
 	go quotaEnforcer.Run(ctx)
+
+	healthMonitor := NewHealthMonitor(configPath, supervisor)
+	go healthMonitor.Run(ctx)
+
+	rotator := NewRotator(configPath, supervisor)
+	go rotator.Run(ctx)
+
+	// Self-heal sweep: guarantees a dead location is restarted even if the
+	// per-process monitor's edge-triggered restart silently fails.
+	go func() {
+		t := time.NewTicker(reconcileTickInterval)
+		defer t.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-t.C:
+				supervisor.Reconcile(ctx, time.Now())
+			}
+		}
+	}()
 
 	reloadc := make(chan os.Signal, 1)
 	signal.Notify(reloadc, syscall.SIGHUP)
@@ -432,6 +499,14 @@ func run() error {
 			return
 		}
 		writeJSON(w, collectMetrics(supervisor))
+	})))
+	handler.Handle("/api/health", adminAuth(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			w.Header().Set("Allow", http.MethodGet)
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		writeJSON(w, healthMonitor.Snapshot())
 	})))
 	handler.Handle("/api/audit", adminAuth(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
@@ -563,6 +638,24 @@ func run() error {
 		w.WriteHeader(http.StatusCreated)
 		writeJSON(w, map[string]string{"client_id": clientID})
 	})))
+	handler.Handle("/api/friends", adminAuth(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			w.Header().Set("Allow", http.MethodPost)
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		resp, err := addFriendFromRequest(configPath, r)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		if err := reload(); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		w.WriteHeader(http.StatusCreated)
+		writeJSON(w, resp)
+	})))
 	handler.Handle("/api/clients/", adminAuth(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodDelete && r.Method != http.MethodPut && r.Method != http.MethodPost {
 			w.Header().Set("Allow", "DELETE, PUT, POST")
@@ -679,6 +772,8 @@ func NewSupervisor(olcrtcPath string, start starter) *Supervisor {
 	return &Supervisor{
 		olcrtcPath: olcrtcPath,
 		processes:  make(map[string]*process),
+		lingering:  make(map[string]time.Time),
+		restarting: make(map[string]struct{}),
 		start:      start,
 	}
 }
@@ -745,6 +840,12 @@ func (s *Supervisor) Reload(ctx context.Context, cfg Config) error {
 	}
 
 	for id, currentLoc := range current {
+		// A lingering OLD srv (autorotation grace) is intentionally absent from
+		// the next config; leave it to its time.AfterFunc teardown, do not stop
+		// it here (that would collapse the rotation overlap).
+		if _, lingering := s.lingering[id]; lingering {
+			continue
+		}
 		nextLoc, exists := next[id]
 		if !exists || !reflect.DeepEqual(currentLoc, nextLoc) {
 			s.stopLocked(id)
@@ -762,6 +863,7 @@ func (s *Supervisor) Reload(ctx context.Context, cfg Config) error {
 func (s *Supervisor) StopAll() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.stopped = true
 	if s.quota != nil {
 		for id := range s.processes {
 			s.quota.Unregister(id)
@@ -915,14 +1017,19 @@ func (s *Supervisor) Restart(ctx context.Context, clientID, roomID, transport st
 	}
 	loc := p.location
 	s.stopLocked(key)
+	s.restarting[key] = struct{}{} // the self-heal sweep must not resurrect this key mid-restart
 	s.mu.Unlock()
 
-	if err := waitProcessStopped(ctx, p, 5*time.Second); err != nil {
-		return err
-	}
+	waitErr := waitProcessStopped(ctx, p, 5*time.Second)
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	delete(s.restarting, key)
+	if waitErr != nil {
+		// Old process didn't stop in time; leave the key absent so the next
+		// self-heal sweep recovers it rather than abandoning the location.
+		return waitErr
+	}
 	next, err := s.start(context.Background(), s.olcrtcPath, loc)
 	if err != nil {
 		return err
@@ -979,6 +1086,75 @@ func (s *Supervisor) monitorProcess(ctx context.Context, key string, p *process)
 		s.processes[key] = next
 		s.monitorProcess(ctx, key, next)
 	}()
+}
+
+// Self-heal: a level-triggered safety net complementing the per-process monitor
+// (which is edge-triggered and, in rare cases, can fail to restart a dead
+// location — e.g. a wedged monitor goroutine, the exact failure that left a
+// location Down for hours). reconcileTickInterval sets the sweep cadence;
+// selfHealGrace keeps us from fighting the monitor's normal restart backoff on a
+// fresh exit — we only step in once a location has stayed dead clearly longer
+// than the max backoff.
+const (
+	reconcileTickInterval = 30 * time.Second
+	selfHealGrace         = 90 * time.Second
+)
+
+// Reconcile (re)starts any quota-active, non-lingering location whose process is
+// missing or has stayed dead past selfHealGrace. It is idempotent and
+// lock-serialized with monitorProcess: if both try to restart the same key, the
+// monitor's identity guard (s.processes[key] != p) prevents a double start.
+func (s *Supervisor) Reconcile(ctx context.Context, now time.Time) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	// Never resurrect children once we are tearing down: a tick can race the
+	// deferred StopAll (and on the signal path ctx is already cancelled).
+	if s.stopped || ctx.Err() != nil {
+		return
+	}
+	for _, loc := range activeLocations(s.cfg, now) {
+		key := locationKey(loc)
+		if _, lingering := s.lingering[key]; lingering {
+			continue
+		}
+		// A manual Restart leaves the key transiently absent while it waits for
+		// the old process to die; don't double-start it.
+		if _, restarting := s.restarting[key]; restarting {
+			continue
+		}
+		priorRestarts := 0
+		if p, exists := s.processes[key]; exists {
+			st := p.state()
+			if st.Running {
+				continue
+			}
+			// How long has it been dead? Prefer ExitedAt; fall back to StartedAt
+			// so an anomalous running=false-without-exit entry still gets the
+			// grace window instead of an immediate restart. Within grace, leave
+			// it to the per-process monitor's backoff (we don't fight it).
+			ref := st.ExitedAt
+			if ref == "" {
+				ref = st.StartedAt
+			}
+			if ref != "" {
+				if t, err := time.Parse(time.RFC3339, ref); err == nil && now.Sub(t) < selfHealGrace {
+					continue
+				}
+			}
+			priorRestarts = st.Restarts
+			s.stopLocked(key) // clear quota accounting + drop the stale entry
+		}
+		next, err := s.start(ctx, s.olcrtcPath, loc)
+		if err != nil {
+			log.Printf("self-heal: restart for %s failed: %v", key, err)
+			continue
+		}
+		s.registerQuotaLocked(loc, quotaForClient(s.cfg, loc.ClientID), next)
+		next.restarts = priorRestarts + 1 // preserve backoff history across self-heal
+		s.processes[key] = next
+		s.monitorProcess(ctx, key, next)
+		log.Printf("self-heal: restarted dead location %s (restarts=%d)", key, next.restarts)
+	}
 }
 
 func (s *Supervisor) registerQuotaLocked(loc Location, quota Quota, p *process) {
@@ -1343,6 +1519,129 @@ func addClientFromRequest(ctx context.Context, configPath, olcrtcPath string, r 
 	return req.ClientID, nil
 }
 
+type addFriendRequest struct {
+	ClientID  string `json:"client_id"`
+	Name      string `json:"name"`
+	VlessLink string `json:"vless_link"`
+	DualRoute *bool  `json:"dual_route"`
+	DNS       string `json:"dns"`
+}
+
+type addFriendResponse struct {
+	ClientID        string `json:"client_id"`
+	OlcrtcURI       string `json:"olcrtc_uri"`
+	SubToken        string `json:"sub_token"`
+	SubscriptionURL string `json:"subscription_url"`
+	DeepLink        string `json:"deep_link"`
+}
+
+// addFriendFromRequest creates a new client with a fresh jitsi olcrtc location
+// (room + key + stable uid), an always-on sub_token, and an optional pasted VLESS
+// half, then returns the ready subscription URL + one-tap deep link for QR/sharing.
+func addFriendFromRequest(configPath string, r *http.Request) (addFriendResponse, error) {
+	var req addFriendRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		return addFriendResponse{}, fmt.Errorf("parse request: %w", err)
+	}
+	req.ClientID = strings.TrimSpace(req.ClientID)
+	req.Name = strings.TrimSpace(req.Name)
+	req.VlessLink = strings.TrimSpace(req.VlessLink)
+	req.DNS = strings.TrimSpace(req.DNS)
+	if req.ClientID == "" {
+		return addFriendResponse{}, errors.New("client_id is required")
+	}
+	if strings.Contains(req.ClientID, "/") {
+		return addFriendResponse{}, errors.New("client_id must not contain slash")
+	}
+	name := req.Name
+	if name == "" {
+		name = "VPS-main"
+	}
+	if strings.ContainsAny(name, "\r\n") {
+		return addFriendResponse{}, errors.New("name must not contain newlines")
+	}
+	dns := req.DNS
+	if dns == "" {
+		dns = "77.88.8.8:53"
+	}
+
+	cfg, err := loadConfig(configPath)
+	if err != nil {
+		return addFriendResponse{}, err
+	}
+	cfg.ensureClientsFormat()
+	for _, c := range cfg.Clients {
+		if c.ClientID == req.ClientID {
+			return addFriendResponse{}, fmt.Errorf("client %q already exists", req.ClientID)
+		}
+	}
+
+	roomID, err := generateRoomIDForCarrier("jitsi", "")
+	if err != nil {
+		return addFriendResponse{}, err
+	}
+	key, err := randomHex(32)
+	if err != nil {
+		return addFriendResponse{}, err
+	}
+	uid, err := randomUUID()
+	if err != nil {
+		return addFriendResponse{}, err
+	}
+	token, err := generateSubToken()
+	if err != nil {
+		return addFriendResponse{}, err
+	}
+
+	loc := Location{
+		Name:      name,
+		ClientID:  req.ClientID,
+		Endpoint:  Endpoint{RoomID: roomID, Key: key},
+		Carrier:   "jitsi",
+		Transport: Transport{Type: "datachannel"},
+		DNS:       dns,
+		Uid:       uid,
+	}
+	client := Client{
+		ClientID:  req.ClientID,
+		Locations: []Location{loc},
+		SubToken:  token,
+	}
+	if req.VlessLink != "" {
+		client.Vless = &VlessConfig{Link: req.VlessLink, DualRoute: req.DualRoute}
+	}
+	cfg.Clients = append(cfg.Clients, client)
+	cfg.Normalize()
+	if err := cfg.Validate(); err != nil {
+		return addFriendResponse{}, err
+	}
+	if err := saveConfig(configPath, cfg); err != nil {
+		return addFriendResponse{}, err
+	}
+
+	base := strings.TrimRight(cfg.PublicSubBase, "/")
+	if base == "" {
+		base = defaultPublicSubBase
+	}
+	subURL := fmt.Sprintf("%s/%s?format=wireturn&token=%s", base, url.PathEscape(req.ClientID), url.QueryEscape(token))
+	deepLink := fmt.Sprintf("wireturn://addsub?url=%s&name=%s", url.QueryEscape(subURL), url.QueryEscape(name))
+	return addFriendResponse{
+		ClientID:        req.ClientID,
+		OlcrtcURI:       locationURI(loc),
+		SubToken:        token,
+		SubscriptionURL: subURL,
+		DeepLink:        deepLink,
+	}, nil
+}
+
+func generateSubToken() (string, error) {
+	buf := make([]byte, 18)
+	if _, err := rand.Read(buf); err != nil {
+		return "", err
+	}
+	return base64.RawURLEncoding.EncodeToString(buf), nil
+}
+
 func updateClientFromRequest(ctx context.Context, configPath, olcrtcPath, clientID string, r *http.Request) error {
 	_ = ctx
 	_ = olcrtcPath
@@ -1475,6 +1774,12 @@ func buildLocations(clientID string, requests []locationRequest) ([]Location, er
 		prefix := fmt.Sprintf("locations[%d]", i)
 		if req.RoomID == "" || req.RoomID == "any" {
 			return nil, fmt.Errorf("%s.room_id must be concrete", prefix)
+		}
+		if strings.ContainsAny(req.RoomID, " \t\r\n@#?$&<>") {
+			return nil, fmt.Errorf("%s.room_id must not contain spaces or any of @ # ? $ & < >", prefix)
+		}
+		if strings.ContainsAny(req.Name, "\r\n") {
+			return nil, fmt.Errorf("%s.name must not contain newlines", prefix)
 		}
 		if err := validateRequestKey(req.Key); err != nil {
 			return nil, fmt.Errorf("%s.key: %w", prefix, err)
@@ -2734,7 +3039,15 @@ func quotaSafeName(value string) string {
 	return b.String()
 }
 
+// configWriteMu serializes ALL config writers (admin handlers, QuotaEnforcer,
+// and the autorotation Rotator) so their read-modify-write cycles cannot
+// interleave and lose updates. Held only across the in-process save; the
+// atomic temp+fsync+rename in writeConfig handles crash safety.
+var configWriteMu sync.Mutex
+
 func saveConfig(path string, cfg Config) error {
+	configWriteMu.Lock()
+	defer configWriteMu.Unlock()
 	backupConfig(path)
 	if err := writeConfig(path, cfg); err != nil {
 		return err
@@ -2744,6 +3057,8 @@ func saveConfig(path string, cfg Config) error {
 }
 
 func saveConfigWithoutBackup(path string, cfg Config) error {
+	configWriteMu.Lock()
+	defer configWriteMu.Unlock()
 	return writeConfig(path, cfg)
 }
 
@@ -2753,9 +3068,23 @@ func writeConfig(path string, cfg Config) error {
 	if err != nil {
 		return fmt.Errorf("marshal config: %w", err)
 	}
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, append(data, '\n'), 0o600); err != nil {
+	dir := filepath.Dir(path)
+	f, err := os.CreateTemp(dir, ".config-*.json.tmp")
+	if err != nil {
+		return fmt.Errorf("create temp config: %w", err)
+	}
+	tmp := f.Name()
+	defer func() { _ = os.Remove(tmp) }() // no-op once renamed
+	if _, err := f.Write(append(data, '\n')); err != nil {
+		_ = f.Close()
 		return fmt.Errorf("write temp config: %w", err)
+	}
+	if err := f.Sync(); err != nil {
+		_ = f.Close()
+		return fmt.Errorf("sync temp config: %w", err)
+	}
+	if err := f.Close(); err != nil {
+		return fmt.Errorf("close temp config: %w", err)
 	}
 	if err := os.Rename(tmp, path); err != nil {
 		return fmt.Errorf("replace config: %w", err)
@@ -2774,6 +3103,48 @@ func backupConfig(path string) {
 	}
 	name := "config-" + time.Now().UTC().Format("20060102-150405") + ".json"
 	_ = os.WriteFile(filepath.Join(dir, name), data, 0o600)
+	if ents, err := os.ReadDir(dir); err == nil {
+		var bk []string
+		for _, e := range ents {
+			if !e.IsDir() && strings.HasPrefix(e.Name(), "config-") && strings.HasSuffix(e.Name(), ".json") {
+				bk = append(bk, e.Name())
+			}
+		}
+		sort.Strings(bk)
+		for len(bk) > 30 {
+			_ = os.Remove(filepath.Join(dir, bk[0]))
+			bk = bk[1:]
+		}
+	}
+}
+
+func loadNewestBackup(path string) (Config, error) {
+	dir := filepath.Join(filepath.Dir(path), "backups")
+	ents, err := os.ReadDir(dir)
+	if err != nil {
+		return Config{}, fmt.Errorf("no backups available: %w", err)
+	}
+	names := make([]string, 0, len(ents))
+	for _, e := range ents {
+		if !e.IsDir() && strings.HasPrefix(e.Name(), "config-") && strings.HasSuffix(e.Name(), ".json") {
+			names = append(names, e.Name())
+		}
+	}
+	if len(names) == 0 {
+		return Config{}, errors.New("no config backups found")
+	}
+	sort.Strings(names)
+	for i := len(names) - 1; i >= 0; i-- {
+		candidate := filepath.Join(dir, names[i])
+		cfg, err := loadConfig(candidate)
+		if err != nil {
+			log.Printf("backup %s also unreadable (%v); trying older", candidate, err)
+			continue
+		}
+		log.Printf("restored config from backup %s", candidate)
+		return cfg, nil
+	}
+	return Config{}, errors.New("no usable config backup found")
 }
 
 func appendAudit(configPath, action, detail string) {
@@ -3038,6 +3409,42 @@ func runCmd(ctx context.Context, name string, args ...string) error {
 	return nil
 }
 
+// legacyCapsHosts are jitsi hosts whose OLD Jicofo only invites participants
+// advertising legacy jitsi-meet XEP-0115 caps. srv processes for these hosts
+// are launched with OLCRTC_LEGACY_CAPS=1; all other hosts use modern caps.
+var legacyCapsHosts = map[string]bool{"meet.samgups.ru": true}
+
+// locationNeedsLegacyCaps reports whether loc's jitsi room host requires legacy caps.
+func locationNeedsLegacyCaps(loc Location) bool {
+	room := loc.Endpoint.RoomID
+	if i := strings.Index(room, "://"); i >= 0 {
+		room = room[i+3:]
+	}
+	if i := strings.IndexAny(room, "/:"); i >= 0 {
+		room = room[:i]
+	}
+	return legacyCapsHosts[strings.TrimSpace(room)]
+}
+
+// olcrtcEnvForLocation returns the child env for an srv process: the parent env
+// with any inherited OLCRTC_LEGACY_CAPS stripped, plus OLCRTC_LEGACY_CAPS=1 only
+// when this location's carrier needs legacy caps. Deterministic regardless of any
+// global/systemd OLCRTC_LEGACY_CAPS value.
+func olcrtcEnvForLocation(loc Location) []string {
+	base := os.Environ()
+	out := make([]string, 0, len(base)+1)
+	for _, kv := range base {
+		if strings.HasPrefix(kv, "OLCRTC_LEGACY_CAPS=") {
+			continue
+		}
+		out = append(out, kv)
+	}
+	if locationNeedsLegacyCaps(loc) {
+		out = append(out, "OLCRTC_LEGACY_CAPS=1")
+	}
+	return out
+}
+
 func startInstance(ctx context.Context, olcrtcPath string, loc Location) (*process, error) {
 	cfg, err := serverConfig(loc)
 	if err != nil {
@@ -3055,6 +3462,7 @@ func startInstance(ctx context.Context, olcrtcPath string, loc Location) (*proce
 
 	cmdArgs := []string{"netns", "exec", ns.Name, olcrtcPath, configPath}
 	cmd := exec.CommandContext(ctx, "ip", cmdArgs...)
+	cmd.Env = olcrtcEnvForLocation(loc)
 	logs := newLogBuffer(500)
 	cmd.Stdout = logWriter{stream: "stdout", buffer: logs}
 	cmd.Stderr = logWriter{stream: "stderr", buffer: logs}
@@ -3918,7 +4326,19 @@ func subscriptionForLocations(name, refresh string, locations []Location, quota 
 }
 
 func locationURI(loc Location) string {
-	payload := payloadString(loc.Transport.Payload)
+	// Carry the per-location DNS in the olcrtc payload so the client uses the
+	// admin's DNS (e.g. 77.88.8.8) instead of its built-in default. olcrtc clients
+	// ignore unknown payload keys, so this stays backward-compatible.
+	payloadMap := loc.Transport.Payload
+	if strings.TrimSpace(loc.DNS) != "" {
+		merged := make(map[string]string, len(payloadMap)+1)
+		for k, v := range payloadMap {
+			merged[k] = v
+		}
+		merged["dns"] = loc.DNS
+		payloadMap = merged
+	}
+	payload := payloadString(payloadMap)
 	return fmt.Sprintf("olcrtc://%s?%s%s@%s#%s$%s",
 		loc.Carrier,
 		loc.Transport.Type,
@@ -3941,12 +4361,13 @@ type wtVlessConfig struct {
 }
 
 type wtProfile struct {
-	Uid          string         `json:"uid"`
-	Name         string         `json:"name"`
-	OlcrtcURL    string         `json:"olcrtcUrl"`
-	XrayEnabled  bool           `json:"xrayEnabled"`
-	XrayProtocol string         `json:"xrayProtocol,omitempty"`
-	VlessConfig  *wtVlessConfig `json:"vlessConfig,omitempty"`
+	Uid              string         `json:"uid"`
+	Name             string         `json:"name"`
+	OlcrtcURL        string         `json:"olcrtcUrl"`
+	OlcrtcAlternates []string       `json:"olcrtcAlternates,omitempty"`
+	XrayEnabled      bool           `json:"xrayEnabled"`
+	XrayProtocol     string         `json:"xrayProtocol,omitempty"`
+	VlessConfig      *wtVlessConfig `json:"vlessConfig,omitempty"`
 }
 
 // wireturnProfilesForClient builds WireTurn-format profiles (one per location)
@@ -3995,12 +4416,36 @@ func wireturnProfilesForClient(cfg Config, clientID, token string, now time.Time
 			Mux:           mux,
 		}
 	}
-	profiles := make([]wtProfile, 0, len(client.Locations))
+	// Split locations into primaries (own profile) and backups (attached to each
+	// primary as olcrtcAlternates for client-side auto-failover). If no location
+	// is a primary, treat every location as a primary (legacy behavior) so a
+	// client of all-backup locations still gets profiles.
+	primaries := make([]Location, 0, len(client.Locations))
+	backups := make([]Location, 0, len(client.Locations))
 	for _, loc := range client.Locations {
+		if loc.Backup {
+			backups = append(backups, loc)
+		} else {
+			primaries = append(primaries, loc)
+		}
+	}
+	if len(primaries) == 0 {
+		primaries = client.Locations
+		backups = nil
+	}
+	alts := make([]string, 0, len(backups))
+	for _, b := range backups {
+		alts = append(alts, locationURI(b))
+	}
+	profiles := make([]wtProfile, 0, len(primaries))
+	for _, loc := range primaries {
 		p := wtProfile{
 			Uid:       wireturnUID(clientID, loc),
 			Name:      loc.Name,
 			OlcrtcURL: locationURI(loc),
+		}
+		if len(alts) > 0 {
+			p.OlcrtcAlternates = alts
 		}
 		if vless != nil {
 			p.XrayEnabled = true

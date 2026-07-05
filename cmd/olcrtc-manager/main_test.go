@@ -305,6 +305,91 @@ func TestSubscriptionHandlerRejectsRootAndUnknownClient(t *testing.T) {
 	}
 }
 
+func TestReconcileSelfHealsStuckDeadLocation(t *testing.T) {
+	var starts int
+	supervisor := NewSupervisor("olcrtc", func(ctx context.Context, path string, loc Location) (*process, error) {
+		starts++
+		// done is nil on purpose: the per-process monitor blocks forever, i.e.
+		// the edge-triggered restart never fires — the exact wedge that left a
+		// location Down for hours. Reconcile must recover regardless.
+		return &process{location: loc, logs: newLogBuffer(1), running: true}, nil
+	})
+	loc := testLocation("room-01", "Netherlands")
+	if err := supervisor.StartAll(context.Background(), testConfig(loc)); err != nil {
+		t.Fatal(err)
+	}
+	if starts != 1 {
+		t.Fatalf("StartAll starts = %d, want 1", starts)
+	}
+	key := locationKey(loc)
+
+	// A healthy (running) location must be left alone.
+	supervisor.Reconcile(context.Background(), time.Now())
+	if starts != 1 {
+		t.Fatalf("Reconcile restarted a healthy location: starts = %d, want 1", starts)
+	}
+
+	// Simulate the process dying with a wedged monitor (no auto-restart).
+	supervisor.mu.Lock()
+	p := supervisor.processes[key]
+	supervisor.mu.Unlock()
+	p.mu.Lock()
+	p.running = false
+	p.exited = time.Now()
+	p.mu.Unlock()
+
+	// A fresh death stays within the grace window -> left to the monitor's backoff.
+	supervisor.Reconcile(context.Background(), time.Now())
+	if starts != 1 {
+		t.Fatalf("Reconcile self-healed within grace window: starts = %d, want 1", starts)
+	}
+
+	// Past the grace window -> self-heal restarts it.
+	supervisor.Reconcile(context.Background(), time.Now().Add(selfHealGrace+time.Second))
+	if starts != 2 {
+		t.Fatalf("Reconcile did not self-heal stuck-dead location: starts = %d, want 2", starts)
+	}
+	supervisor.mu.Lock()
+	np := supervisor.processes[key]
+	supervisor.mu.Unlock()
+	if np == nil || !np.state().Running {
+		t.Fatal("self-healed process is not running")
+	}
+
+	// Missing-entry path: a key absent from the map (e.g. a Restart that timed
+	// out) is recovered on the next sweep.
+	supervisor.mu.Lock()
+	delete(supervisor.processes, key)
+	supervisor.mu.Unlock()
+	supervisor.Reconcile(context.Background(), time.Now())
+	if starts != 3 {
+		t.Fatalf("Reconcile did not recover a missing entry: starts = %d, want 3", starts)
+	}
+
+	// restarting-set: a key mid-manual-restart must be skipped, not resurrected.
+	supervisor.mu.Lock()
+	delete(supervisor.processes, key)
+	supervisor.restarting[key] = struct{}{}
+	supervisor.mu.Unlock()
+	supervisor.Reconcile(context.Background(), time.Now())
+	if starts != 3 {
+		t.Fatalf("Reconcile resurrected a key mid-restart: starts = %d, want 3", starts)
+	}
+	supervisor.mu.Lock()
+	delete(supervisor.restarting, key)
+	supervisor.mu.Unlock()
+
+	// Shutdown guard: no restarts once StopAll has marked the supervisor stopped.
+	supervisor.mu.Lock()
+	delete(supervisor.processes, key)
+	supervisor.stopped = true
+	supervisor.mu.Unlock()
+	supervisor.Reconcile(context.Background(), time.Now())
+	if starts != 3 {
+		t.Fatalf("Reconcile spawned a child after shutdown: starts = %d, want 3", starts)
+	}
+}
+
 func TestUpdateSettingsNormalizesSubscriptionPath(t *testing.T) {
 	dir := t.TempDir()
 	configPath := filepath.Join(dir, "config.json")
