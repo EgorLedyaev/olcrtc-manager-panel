@@ -160,6 +160,10 @@ type Location struct {
 	// jitsi room/key. Written only by the Rotator (never by the admin); used as
 	// the age anchor for the next rotation.
 	RotatedAt string `json:"rotated_at,omitempty"`
+	// Backup marks this location as a failover alternate rather than a primary.
+	// Primaries are emitted as their own WireTurn profile; backups are attached
+	// to the primary profile(s) as olcrtcAlternates for client-side auto-failover.
+	Backup bool `json:"backup,omitempty"`
 }
 
 type Endpoint struct {
@@ -3405,6 +3409,42 @@ func runCmd(ctx context.Context, name string, args ...string) error {
 	return nil
 }
 
+// legacyCapsHosts are jitsi hosts whose OLD Jicofo only invites participants
+// advertising legacy jitsi-meet XEP-0115 caps. srv processes for these hosts
+// are launched with OLCRTC_LEGACY_CAPS=1; all other hosts use modern caps.
+var legacyCapsHosts = map[string]bool{"meet.samgups.ru": true}
+
+// locationNeedsLegacyCaps reports whether loc's jitsi room host requires legacy caps.
+func locationNeedsLegacyCaps(loc Location) bool {
+	room := loc.Endpoint.RoomID
+	if i := strings.Index(room, "://"); i >= 0 {
+		room = room[i+3:]
+	}
+	if i := strings.IndexAny(room, "/:"); i >= 0 {
+		room = room[:i]
+	}
+	return legacyCapsHosts[strings.TrimSpace(room)]
+}
+
+// olcrtcEnvForLocation returns the child env for an srv process: the parent env
+// with any inherited OLCRTC_LEGACY_CAPS stripped, plus OLCRTC_LEGACY_CAPS=1 only
+// when this location's carrier needs legacy caps. Deterministic regardless of any
+// global/systemd OLCRTC_LEGACY_CAPS value.
+func olcrtcEnvForLocation(loc Location) []string {
+	base := os.Environ()
+	out := make([]string, 0, len(base)+1)
+	for _, kv := range base {
+		if strings.HasPrefix(kv, "OLCRTC_LEGACY_CAPS=") {
+			continue
+		}
+		out = append(out, kv)
+	}
+	if locationNeedsLegacyCaps(loc) {
+		out = append(out, "OLCRTC_LEGACY_CAPS=1")
+	}
+	return out
+}
+
 func startInstance(ctx context.Context, olcrtcPath string, loc Location) (*process, error) {
 	cfg, err := serverConfig(loc)
 	if err != nil {
@@ -3422,6 +3462,7 @@ func startInstance(ctx context.Context, olcrtcPath string, loc Location) (*proce
 
 	cmdArgs := []string{"netns", "exec", ns.Name, olcrtcPath, configPath}
 	cmd := exec.CommandContext(ctx, "ip", cmdArgs...)
+	cmd.Env = olcrtcEnvForLocation(loc)
 	logs := newLogBuffer(500)
 	cmd.Stdout = logWriter{stream: "stdout", buffer: logs}
 	cmd.Stderr = logWriter{stream: "stderr", buffer: logs}
@@ -4320,12 +4361,13 @@ type wtVlessConfig struct {
 }
 
 type wtProfile struct {
-	Uid          string         `json:"uid"`
-	Name         string         `json:"name"`
-	OlcrtcURL    string         `json:"olcrtcUrl"`
-	XrayEnabled  bool           `json:"xrayEnabled"`
-	XrayProtocol string         `json:"xrayProtocol,omitempty"`
-	VlessConfig  *wtVlessConfig `json:"vlessConfig,omitempty"`
+	Uid              string         `json:"uid"`
+	Name             string         `json:"name"`
+	OlcrtcURL        string         `json:"olcrtcUrl"`
+	OlcrtcAlternates []string       `json:"olcrtcAlternates,omitempty"`
+	XrayEnabled      bool           `json:"xrayEnabled"`
+	XrayProtocol     string         `json:"xrayProtocol,omitempty"`
+	VlessConfig      *wtVlessConfig `json:"vlessConfig,omitempty"`
 }
 
 // wireturnProfilesForClient builds WireTurn-format profiles (one per location)
@@ -4374,12 +4416,36 @@ func wireturnProfilesForClient(cfg Config, clientID, token string, now time.Time
 			Mux:           mux,
 		}
 	}
-	profiles := make([]wtProfile, 0, len(client.Locations))
+	// Split locations into primaries (own profile) and backups (attached to each
+	// primary as olcrtcAlternates for client-side auto-failover). If no location
+	// is a primary, treat every location as a primary (legacy behavior) so a
+	// client of all-backup locations still gets profiles.
+	primaries := make([]Location, 0, len(client.Locations))
+	backups := make([]Location, 0, len(client.Locations))
 	for _, loc := range client.Locations {
+		if loc.Backup {
+			backups = append(backups, loc)
+		} else {
+			primaries = append(primaries, loc)
+		}
+	}
+	if len(primaries) == 0 {
+		primaries = client.Locations
+		backups = nil
+	}
+	alts := make([]string, 0, len(backups))
+	for _, b := range backups {
+		alts = append(alts, locationURI(b))
+	}
+	profiles := make([]wtProfile, 0, len(primaries))
+	for _, loc := range primaries {
 		p := wtProfile{
 			Uid:       wireturnUID(clientID, loc),
 			Name:      loc.Name,
 			OlcrtcURL: locationURI(loc),
+		}
+		if len(alts) > 0 {
+			p.OlcrtcAlternates = alts
 		}
 		if vless != nil {
 			p.XrayEnabled = true
